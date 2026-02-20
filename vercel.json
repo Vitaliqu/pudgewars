@@ -1,6 +1,0 @@
-{
-  "buildCommand": "cd pudgewars && npm install && npm run build",
-  "outputDirectory": "pudgewars/.next",
-  "installCommand": "echo skip",
-  "framework": "nextjs"
-}
