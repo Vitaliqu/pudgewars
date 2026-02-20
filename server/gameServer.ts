@@ -1,22 +1,26 @@
-import { WebSocketServer, WebSocket } from "ws";
-import { randomUUID } from "crypto";
+import {WebSocketServer, WebSocket} from "ws";
+import {randomUUID} from "crypto";
 
 const PORT = 3001;
-const TICK_RATE = 64;
+const TICK_RATE = 32;
 const TICK = 1000 / TICK_RATE;
 
 const MAP_SIZE = 800;
 const PLAYER_RADIUS = 20;
 
-const SPEED = 5;
-const HOOK_SPEED = 5;
+const SPEED = 10;
+const HOOK_SPEED = 10;
 const HOOK_MAX_DISTANCE = 500;
 const HOOK_COOLDOWN = 3000;
 const HOOK_SPEED_MAX = 20;
 const MAX_CHARGE_TIME = 1500;
 const RESPAWN_TIME = 5000;
 
-interface Vec2 { x: number; y: number; }
+interface Vec2 {
+    x: number;
+    y: number;
+}
+
 interface Hook {
     position: Vec2;
     direction: Vec2;
@@ -25,6 +29,7 @@ interface Hook {
     returning: boolean;
     hookedPlayerId?: string;
 }
+
 interface Player {
     id: string;
     nickname: string;
@@ -36,7 +41,9 @@ interface Player {
     alive: boolean;
     kills: number;
     respawnAt?: number;
+    ping?: number;
 }
+
 interface Room {
     id: string;
     name: string;
@@ -45,6 +52,7 @@ interface Room {
     players: Record<string, Player>;
     serverTime: number;
 }
+
 interface RoomInfo {
     id: string;
     name: string;
@@ -54,27 +62,31 @@ interface RoomInfo {
 
 // ===== State =====
 const rooms: Record<string, Room> = {};
-const wsToId  = new Map<WebSocket, string>();
-const idToWs  = new Map<string, WebSocket>();
+const wsToId = new Map<WebSocket, string>();
+const idToWs = new Map<string, WebSocket>();
 const idToRoom = new Map<string, string>();
 
 // ===== Utils =====
 function clamp(value: number, min: number, max: number) {
     return Math.max(min, Math.min(max, value));
 }
+
 function distance(a: Vec2, b: Vec2) {
     return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
+
 function normalize(v: Vec2): Vec2 {
     const len = Math.sqrt(v.x ** 2 + v.y ** 2);
-    return len === 0 ? { x: 0, y: 0 } : { x: v.x / len, y: v.y / len };
+    return len === 0 ? {x: 0, y: 0} : {x: v.x / len, y: v.y / len};
 }
+
 function randomPosition(): Vec2 {
     return {
         x: PLAYER_RADIUS + Math.random() * (MAP_SIZE - 2 * PLAYER_RADIUS),
         y: PLAYER_RADIUS + Math.random() * (MAP_SIZE - 2 * PLAYER_RADIUS),
     };
 }
+
 function generateRoomId(): string {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let id = "";
@@ -84,12 +96,14 @@ function generateRoomId(): string {
 
 // ===== Room helpers =====
 function roomInfo(r: Room): RoomInfo {
-    return { id: r.id, name: r.name, isPrivate: r.isPrivate, playerCount: Object.keys(r.players).length };
+    return {id: r.id, name: r.name, isPrivate: r.isPrivate, playerCount: Object.keys(r.players).length};
 }
 
 function makeRoom(name: string, isPrivate: boolean, ownerId: string): Room {
     let id: string;
-    do { id = generateRoomId(); } while (rooms[id]);
+    do {
+        id = generateRoomId();
+    } while (rooms[id]);
 
     const room: Room = {
         id,
@@ -109,7 +123,7 @@ function broadcastRoomList() {
         .filter(r => !r.isPrivate)
         .map(roomInfo);
 
-    const msg = JSON.stringify({ type: "room_list", rooms: list });
+    const msg = JSON.stringify({type: "room_list", rooms: list});
 
     // Send only to clients NOT in a room
     for (const [ws, playerId] of wsToId.entries()) {
@@ -128,33 +142,47 @@ function removePlayerFromRoom(playerId: string) {
     delete room.players[playerId];
     idToRoom.delete(playerId);
 
-        if (Object.keys(room.players).length === 0) {
+    if (Object.keys(room.players).length === 0) {
         delete rooms[roomId];
     }
 }
 
 // ===== WebSocket server =====
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({port: PORT});
 
 wss.on("connection", (ws) => {
     const id = randomUUID();
     wsToId.set(ws, id);
     idToWs.set(id, ws);
 
-    ws.send(JSON.stringify({ type: "init", id }));
+    ws.send(JSON.stringify({type: "init", id}));
 
     // Send current public room list
     const list = Object.values(rooms)
         .filter(r => !r.isPrivate)
         .map(roomInfo);
-    ws.send(JSON.stringify({ type: "room_list", rooms: list }));
+    ws.send(JSON.stringify({type: "room_list", rooms: list}));
 
     ws.on("message", (msg) => {
         let data: any;
-        try { data = JSON.parse(msg.toString()); } catch { return; }
+        try {
+            data = JSON.parse(msg.toString());
+        } catch {
+            return;
+        }
 
         const playerId = wsToId.get(ws);
         if (!playerId) return;
+
+        // ===== PING =====
+        if (data.type === "ping") {
+            ws.send(JSON.stringify({type: "pong", t: data.t}));
+            const rId = idToRoom.get(playerId);
+            if (rId && rooms[rId]?.players[playerId] && typeof data.rtt === "number") {
+                rooms[rId].players[playerId].ping = data.rtt;
+            }
+            return;
+        }
 
         // ===== CREATE ROOM =====
         if (data.type === "create_room") {
@@ -170,7 +198,7 @@ wss.on("connection", (ws) => {
                 nickname,
                 color,
                 position: randomPosition(),
-                velocity: { x: 0, y: 0 },
+                velocity: {x: 0, y: 0},
                 hook: null,
                 hookReadyAt: 0,
                 alive: true,
@@ -179,7 +207,7 @@ wss.on("connection", (ws) => {
             room.players[playerId] = player;
             idToRoom.set(playerId, room.id);
 
-            ws.send(JSON.stringify({ type: "room_joined", roomId: room.id, isPrivate: room.isPrivate }));
+            ws.send(JSON.stringify({type: "room_joined", roomId: room.id, isPrivate: room.isPrivate}));
             broadcastRoomList();
             return;
         }
@@ -191,7 +219,7 @@ wss.on("connection", (ws) => {
             const code = String(data.roomId || "").toUpperCase().trim();
             const room = rooms[code];
             if (!room) {
-                ws.send(JSON.stringify({ type: "error", message: "Room not found. Check your code." }));
+                ws.send(JSON.stringify({type: "error", message: "Room not found. Check your code."}));
                 return;
             }
 
@@ -203,7 +231,7 @@ wss.on("connection", (ws) => {
                 nickname,
                 color,
                 position: randomPosition(),
-                velocity: { x: 0, y: 0 },
+                velocity: {x: 0, y: 0},
                 hook: null,
                 hookReadyAt: 0,
                 alive: true,
@@ -212,7 +240,7 @@ wss.on("connection", (ws) => {
             room.players[playerId] = player;
             idToRoom.set(playerId, room.id);
 
-            ws.send(JSON.stringify({ type: "room_joined", roomId: room.id, isPrivate: room.isPrivate }));
+            ws.send(JSON.stringify({type: "room_joined", roomId: room.id, isPrivate: room.isPrivate}));
             broadcastRoomList();
             return;
         }
@@ -220,13 +248,13 @@ wss.on("connection", (ws) => {
         // ===== LEAVE ROOM =====
         if (data.type === "leave_room") {
             removePlayerFromRoom(playerId);
-            ws.send(JSON.stringify({ type: "room_left" }));
+            ws.send(JSON.stringify({type: "room_left"}));
 
             // Send updated room list to this client (now in lobby)
             const list = Object.values(rooms)
                 .filter(r => !r.isPrivate)
                 .map(roomInfo);
-            ws.send(JSON.stringify({ type: "room_list", rooms: list }));
+            ws.send(JSON.stringify({type: "room_list", rooms: list}));
 
             broadcastRoomList();
             return;
@@ -248,7 +276,7 @@ wss.on("connection", (ws) => {
                 const factor = typeof data.speedFactor === "number"
                     ? Math.max(0.1, Math.min(1.0, data.speedFactor))
                     : 1.0;
-                player.velocity = { x: dir.x * factor, y: dir.y * factor };
+                player.velocity = {x: dir.x * factor, y: dir.y * factor};
             }
         }
 
@@ -266,7 +294,7 @@ wss.on("connection", (ws) => {
             const speed = HOOK_SPEED + t * (HOOK_SPEED_MAX - HOOK_SPEED);
 
             player.hook = {
-                position: { ...player.position },
+                position: {...player.position},
                 direction: dir,
                 speed,
                 ownerId: player.id,
@@ -325,7 +353,7 @@ function updateHook(player: Player, roomPlayers: Record<string, Player>) {
         }
 
     } else {
-        const toOwner = normalize({ x: player.position.x - hook.position.x, y: player.position.y - hook.position.y });
+        const toOwner = normalize({x: player.position.x - hook.position.x, y: player.position.y - hook.position.y});
         hook.position.x += toOwner.x * HOOK_SPEED;
         hook.position.y += toOwner.y * HOOK_SPEED;
 
@@ -333,13 +361,17 @@ function updateHook(player: Player, roomPlayers: Record<string, Player>) {
             const target = roomPlayers[hook.hookedPlayerId];
             const owner = roomPlayers[hook.ownerId];
             if (target && owner) {
-                const toOwnerVec = { x: owner.position.x - target.position.x, y: owner.position.y - target.position.y };
+                const toOwnerVec = {x: owner.position.x - target.position.x, y: owner.position.y - target.position.y};
                 const distToOwner = distance(target.position, owner.position);
                 const moveDist = Math.min(HOOK_SPEED, distToOwner);
                 const dir = normalize(toOwnerVec);
-
-                target.position.x += dir.x * moveDist;
-                target.position.y += dir.y * moveDist;
+                if (!target.alive) {
+                    target.position.x += dir.x * moveDist;
+                    target.position.y += dir.y * moveDist;
+                } else {
+                    hook.position.x = owner.position.x;
+                    hook.position.y = owner.position.y;
+                }
             }
         }
 
@@ -355,7 +387,7 @@ function respawnPlayers(room: Room) {
         if (!player.alive && player.respawnAt && now >= player.respawnAt) {
             player.alive = true;
             player.position = randomPosition();
-            player.velocity = { x: 0, y: 0 };
+            player.velocity = {x: 0, y: 0};
             player.hook = null;
             player.respawnAt = undefined;
             player.hookReadyAt = now;
@@ -374,7 +406,7 @@ function gameLoop() {
 
         respawnPlayers(room);
 
-        const state = JSON.stringify({ players: room.players, serverTime: room.serverTime });
+        const state = JSON.stringify({players: room.players, serverTime: room.serverTime});
         for (const pid of Object.keys(room.players)) {
             const clientWs = idToWs.get(pid);
             if (clientWs && clientWs.readyState === 1) {

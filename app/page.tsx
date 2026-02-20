@@ -11,8 +11,9 @@ const CHARGING_SPEED_MIN = 0.15;
 const MAP_SIZE = 800;
 const PLAYER_RADIUS = 20;
 const SPEED = 5;
-const INTERP_DELAY_MS = 100; // render others this far behind real-time
-const RECONCILE_SNAP = 80;   // snap to server if gap exceeds this (px)
+const INTERP_DELAY_MS = 80;  // render others this far behind real-time (~2.5 server ticks at 32hz)
+const RECONCILE_SNAP = 100;  // hard-snap to server if gap exceeds this (px)
+const SERVER_TICK_MS = 1000 / 32; // must match server TICK
 
 const COLOR_SWATCHES = [
   "#06b6d4", "#ef4444", "#22c55e", "#a855f7",
@@ -26,6 +27,7 @@ interface PlayerHUD {
   alive: boolean;
   kills: number;
   respawnIn?: number;
+  ping?: number;
 }
 
 interface RoomInfo {
@@ -55,9 +57,14 @@ export default function Game() {
   const prevAliveRef = useRef<Record<string, boolean>>({});
   const rafRef = useRef<number>(0);
   const hookChargeStartRef = useRef<number | null>(null);
-  const predictedPosRef = useRef({ x: 400, y: 400 });
-  const serverPosRef    = useRef<{ x: number; y: number } | null>(null);
-  const stateBufferRef  = useRef<Array<{ t: number; players: Record<string, any> }>>([]);
+  const predictedPosRef    = useRef({ x: 400, y: 400 });
+  // Server snapshot: position + the estimated server-tick timestamp (now - ping/2)
+  const serverSnapshotRef  = useRef<{ pos: { x: number; y: number }; t: number } | null>(null);
+  const stateBufferRef     = useRef<Array<{ t: number; players: Record<string, any> }>>([]);
+  const lastPredictTimeRef = useRef(0);
+  const myPingRef          = useRef(0);
+  // Per-frame input history for CS2-style input-replay reconciliation
+  const inputHistoryRef    = useRef<Array<{ t: number; vx: number; vy: number; sf: number }>>([]);
 
   const [screen, setScreen] = useState<"menu" | "game">("menu");
   const [nickname, setNickname] = useState("Player");
@@ -88,7 +95,14 @@ export default function Game() {
       const socket = new WebSocket(WS_URL);
       socketRef.current = socket;
 
-      socket.onopen = () => setConnectionStatus("Online");
+      let pingInterval: ReturnType<typeof setInterval>;
+      socket.onopen = () => {
+        setConnectionStatus("Online");
+        pingInterval = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN)
+            socket.send(JSON.stringify({ type: "ping", t: Date.now(), rtt: myPingRef.current }));
+        }, 2000);
+      };
 
       socket.onclose = () => {
         setConnectionStatus("Offline");
@@ -96,12 +110,18 @@ export default function Game() {
         setScreen("menu");
         stateRef.current = null;
         setPlayersHUD([]);
+        clearInterval(pingInterval);
         // Retry after 2 s
         if (!destroyed) retryTimer = setTimeout(connect, 2000);
       };
 
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
+
+        if (data.type === "pong") {
+          myPingRef.current = Date.now() - data.t;
+          return;
+        }
 
         if (data.type === "init") {
           myIdRef.current = data.id;
@@ -121,7 +141,8 @@ export default function Game() {
           prevAliveRef.current = {};
           particlesRef.current = [];
           predictedPosRef.current = { x: 400, y: 400 };
-          serverPosRef.current = null;
+          serverSnapshotRef.current = null;
+          inputHistoryRef.current = [];
           stateBufferRef.current = [];
           setScreen("game");
           return;
@@ -145,10 +166,15 @@ export default function Game() {
         const myId = myIdRef.current;
         if (myId && data.players[myId]) {
           const sm = data.players[myId];
-          serverPosRef.current = { x: sm.position.x, y: sm.position.y };
+          // Estimate when the server computed this tick (one-way trip ago)
+          serverSnapshotRef.current = {
+            pos: { x: sm.position.x, y: sm.position.y },
+            t: Date.now() - myPingRef.current / 2,
+          };
           // Re-anchor prediction on respawn (dead → alive transition)
           if (!prevAliveRef.current[myId] && sm.alive) {
             predictedPosRef.current = { x: sm.position.x, y: sm.position.y };
+            inputHistoryRef.current = [];
           }
         }
         stateBufferRef.current.push({ t: Date.now(), players: data.players });
@@ -434,6 +460,7 @@ export default function Game() {
         alive: p.alive,
         kills: p.kills ?? 0,
         respawnIn: p.respawnAt ? Math.max(0, Math.ceil((p.respawnAt - now) / 1000)) : 0,
+        ping: p.id === myIdRef.current ? myPingRef.current : p.ping,
       })));
       const me = state.players[myIdRef.current!];
       if (me) setCooldownLeft(Math.max(0, me.hookReadyAt - now));
@@ -442,7 +469,7 @@ export default function Game() {
         : 0);
     }
 
-    // ── Client prediction ─────────────────────────────────────────────────
+    // ── Client prediction (CS2-style input replay) ────────────────────────
     function predictStep() {
       const myId = myIdRef.current;
       const state = stateRef.current;
@@ -450,16 +477,11 @@ export default function Game() {
       const me = state.players[myId];
       if (!me?.alive) return;
 
-      // Hook extending outward → server zeroes velocity, don't move locally
-      if (me.hook && !me.hook.returning) {
-        if (serverPosRef.current) {
-          predictedPosRef.current.x += (serverPosRef.current.x - predictedPosRef.current.x) * 0.3;
-          predictedPosRef.current.y += (serverPosRef.current.y - predictedPosRef.current.y) * 0.3;
-        }
-        return;
-      }
+      const now = Date.now();
+      const dt = lastPredictTimeRef.current ? now - lastPredictTimeRef.current : SERVER_TICK_MS;
+      lastPredictTimeRef.current = now;
 
-      // Replicate server movement with current inputs
+      // Sample current input
       let vx = 0, vy = 0;
       if (keysRef.current["w"]) vy--;
       if (keysRef.current["s"]) vy++;
@@ -467,27 +489,63 @@ export default function Game() {
       if (keysRef.current["d"]) vx++;
       const vlen = Math.sqrt(vx * vx + vy * vy);
       if (vlen > 0) { vx /= vlen; vy /= vlen; }
-
       let sf = 1.0;
       if (hookChargeStartRef.current !== null) {
-        const ct = Math.min(1, (Date.now() - hookChargeStartRef.current) / CHARGE_RAMP_TIME);
+        const ct = Math.min(1, (now - hookChargeStartRef.current) / CHARGE_RAMP_TIME);
         sf = 1.0 - (1.0 - CHARGING_SPEED_MIN) * ct;
       }
 
-      const pred = predictedPosRef.current;
-      pred.x = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.x + vx * sf * SPEED));
-      pred.y = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.y + vy * sf * SPEED));
+      // Record this frame's input for replay
+      const hist = inputHistoryRef.current;
+      hist.push({ t: now, vx, vy, sf });
+      // Prune inputs older than 2 s
+      while (hist.length > 1 && hist[0].t < now - 2000) hist.shift();
 
-      // Reconcile with server authority
-      if (serverPosRef.current) {
-        const dx = serverPosRef.current.x - pred.x;
-        const dy = serverPosRef.current.y - pred.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
+      const pred = predictedPosRef.current;
+
+      // Hook extending outward → server controls our pos, drift toward snapshot
+      if (me.hook && !me.hook.returning) {
+        const snap = serverSnapshotRef.current;
+        if (snap) {
+          const a = 1 - Math.pow(0.7, dt / (1000 / 60));
+          pred.x += (snap.pos.x - pred.x) * a;
+          pred.y += (snap.pos.y - pred.y) * a;
+        }
+        return;
+      }
+
+      // Apply this frame's movement prediction immediately (zero-latency feel)
+      const ticks = dt / SERVER_TICK_MS;
+      pred.x = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.x + vx * sf * SPEED * ticks));
+      pred.y = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.y + vy * sf * SPEED * ticks));
+
+      // ── Input-replay reconciliation ──────────────────────────────────────
+      // Replay all recorded inputs from the last server snapshot forward.
+      // This gives the "ground truth" local position as the server would see it.
+      // Any error vs our running prediction is corrected smoothly (~80ms).
+      const snap = serverSnapshotRef.current;
+      if (snap) {
+        let rx = snap.pos.x;
+        let ry = snap.pos.y;
+        for (let i = 0; i < hist.length; i++) {
+          if (hist[i].t <= snap.t) continue;
+          const prevT = i > 0 ? Math.max(hist[i - 1].t, snap.t) : snap.t;
+          const stepTicks = (hist[i].t - prevT) / SERVER_TICK_MS;
+          rx = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, rx + hist[i].vx * hist[i].sf * SPEED * stepTicks));
+          ry = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, ry + hist[i].vy * hist[i].sf * SPEED * stepTicks));
+        }
+
+        const ex = rx - pred.x;
+        const ey = ry - pred.y;
+        const dist = Math.sqrt(ex * ex + ey * ey);
         if (dist > RECONCILE_SNAP) {
-          predictedPosRef.current = { x: serverPosRef.current.x, y: serverPosRef.current.y };
-        } else if (dist > 1) {
-          pred.x += dx * 0.3;
-          pred.y += dy * 0.3;
+          pred.x = rx;
+          pred.y = ry;
+        } else if (dist > 0.5) {
+          // Smooth correction converging over ~80ms — invisible to the player
+          const corrRate = Math.min(1, dt / 80);
+          pred.x += ex * corrRate;
+          pred.y += ey * corrRate;
         }
       }
     }
@@ -676,7 +734,7 @@ export default function Game() {
                   <button
                     key={c}
                     onClick={() => setSelectedColor(c)}
-                    className={`w-8 h-8 rounded-lg border-2 transition-all ${
+                    className={`w-8 h-8 rounded-lg cursor-pointer border-2 transition-all ${
                       selectedColor === c
                         ? "border-white scale-110 shadow-lg"
                         : "border-transparent hover:border-white/40 hover:scale-105"
@@ -712,7 +770,7 @@ export default function Game() {
             <button
               onClick={handleCreateRoom}
               disabled={connectionStatus !== "Online"}
-              className="mt-auto bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-black font-bold py-2 rounded-lg text-sm transition-colors"
+              className="mt-auto cursor-pointer bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed text-black font-bold py-2 rounded-lg text-sm transition-colors"
             >
               Create &amp; Play
             </button>
@@ -732,7 +790,7 @@ export default function Game() {
             <button
               onClick={() => handleJoinRoom(joinCode)}
               disabled={joinCode.length < 4 || connectionStatus !== "Online"}
-              className="bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold px-5 py-2 rounded-lg text-sm transition-colors"
+              className="bg-zinc-700 cursor-pointer hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold px-5 py-2 rounded-lg text-sm transition-colors"
             >
               Join
             </button>
@@ -761,7 +819,7 @@ export default function Game() {
                   <button
                     onClick={() => handleJoinRoom(r.id)}
                     disabled={connectionStatus !== "Online"}
-                    className="bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/30 text-cyan-400 text-xs font-bold px-4 py-1.5 rounded-lg transition-colors disabled:opacity-40"
+                    className="bg-cyan-500/20 cursor-pointer hover:bg-cyan-500/30 border border-cyan-500/30 text-cyan-400 text-xs font-bold px-4 py-1.5 rounded-lg transition-colors disabled:opacity-40"
                   >
                     Join
                   </button>
@@ -799,7 +857,7 @@ export default function Game() {
           <div className="flex flex-col gap-2">
             <button
               onClick={handleLeaveRoom}
-              className="pointer-events-auto flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-zinc-900/80 border-white/10 text-zinc-400 hover:text-zinc-200 hover:border-white/20 text-xs font-bold tracking-widest uppercase transition-colors backdrop-blur-md"
+              className="pointer-events-auto cursor-pointer flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-zinc-900/80 border-white/10 text-zinc-400 hover:text-zinc-200 hover:border-white/20 text-xs font-bold tracking-widest uppercase transition-colors backdrop-blur-md"
             >
               ← Leave
             </button>
@@ -848,6 +906,13 @@ export default function Game() {
                       {!p.alive && p.respawnIn !== undefined && p.respawnIn > 0 && (
                         <span className="text-[10px] font-mono bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-500">
                           {p.respawnIn}s
+                        </span>
+                      )}
+                      {p.ping !== undefined && p.ping > 0 && (
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded tabular-nums ${
+                          p.ping < 60 ? "text-emerald-400" : p.ping < 120 ? "text-amber-400" : "text-red-400"
+                        }`}>
+                          {p.ping}ms
                         </span>
                       )}
                       <span className={`text-sm font-black tabular-nums w-6 text-right ${p.kills > 0 ? (isMe ? "text-cyan-400" : "text-zinc-200") : "text-zinc-600"}`}>
