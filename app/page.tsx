@@ -4,8 +4,15 @@ import { useEffect, useRef, useState } from "react";
 
 const HOOK_COOLDOWN = 3000;
 const MAX_CHARGE_TIME = 1500;
-const CHARGE_RAMP_TIME = 500;   // ms to reach minimum speed
+const CHARGE_RAMP_TIME = 500;
 const CHARGING_SPEED_MIN = 0.15;
+
+// Must mirror server constants for accurate prediction
+const MAP_SIZE = 800;
+const PLAYER_RADIUS = 20;
+const SPEED = 5;
+const INTERP_DELAY_MS = 100; // render others this far behind real-time
+const RECONCILE_SNAP = 80;   // snap to server if gap exceeds this (px)
 
 const COLOR_SWATCHES = [
   "#06b6d4", "#ef4444", "#22c55e", "#a855f7",
@@ -48,6 +55,9 @@ export default function Game() {
   const prevAliveRef = useRef<Record<string, boolean>>({});
   const rafRef = useRef<number>(0);
   const hookChargeStartRef = useRef<number | null>(null);
+  const predictedPosRef = useRef({ x: 400, y: 400 });
+  const serverPosRef    = useRef<{ x: number; y: number } | null>(null);
+  const stateBufferRef  = useRef<Array<{ t: number; players: Record<string, any> }>>([]);
 
   const [screen, setScreen] = useState<"menu" | "game">("menu");
   const [nickname, setNickname] = useState("Player");
@@ -67,55 +77,93 @@ export default function Game() {
 
   // ── WebSocket effect ───────────────────────────────────────────────────
   useEffect(() => {
-    const socket = new WebSocket(process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:3001");
-    socketRef.current = socket;
+    const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:3001";
+    let destroyed = false;
+    let retryTimer: ReturnType<typeof setTimeout>;
 
-    socket.onopen = () => setConnectionStatus("Online");
-    socket.onclose = () => setConnectionStatus("Offline");
+    function connect() {
+      if (destroyed) return;
+      setConnectionStatus("Connecting...");
 
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      const socket = new WebSocket(WS_URL);
+      socketRef.current = socket;
 
-      if (data.type === "init") {
-        myIdRef.current = data.id;
-        return;
-      }
+      socket.onopen = () => setConnectionStatus("Online");
 
-      if (data.type === "room_list") {
-        setOpenRooms(data.rooms);
-        return;
-      }
-
-      if (data.type === "room_joined") {
-        setCurrentRoomId(data.roomId);
-        setIsCurrentRoomPrivate(data.isPrivate);
-        setErrorMsg("");
-        stateRef.current = null;
-        prevAliveRef.current = {};
-        particlesRef.current = [];
-        setScreen("game");
-        return;
-      }
-
-      if (data.type === "room_left") {
-        setCurrentRoomId(null);
-        setIsCurrentRoomPrivate(false);
+      socket.onclose = () => {
+        setConnectionStatus("Offline");
+        // If we were in-game, drop back to menu so state is clean
+        setScreen("menu");
         stateRef.current = null;
         setPlayersHUD([]);
-        setScreen("menu");
-        return;
-      }
+        // Retry after 2 s
+        if (!destroyed) retryTimer = setTimeout(connect, 2000);
+      };
 
-      if (data.type === "error") {
-        setErrorMsg(data.message);
-        return;
-      }
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
 
-      // Raw game state blob
-      stateRef.current = data;
+        if (data.type === "init") {
+          myIdRef.current = data.id;
+          return;
+        }
+
+        if (data.type === "room_list") {
+          setOpenRooms(data.rooms);
+          return;
+        }
+
+        if (data.type === "room_joined") {
+          setCurrentRoomId(data.roomId);
+          setIsCurrentRoomPrivate(data.isPrivate);
+          setErrorMsg("");
+          stateRef.current = null;
+          prevAliveRef.current = {};
+          particlesRef.current = [];
+          predictedPosRef.current = { x: 400, y: 400 };
+          serverPosRef.current = null;
+          stateBufferRef.current = [];
+          setScreen("game");
+          return;
+        }
+
+        if (data.type === "room_left") {
+          setCurrentRoomId(null);
+          setIsCurrentRoomPrivate(false);
+          stateRef.current = null;
+          setPlayersHUD([]);
+          setScreen("menu");
+          return;
+        }
+
+        if (data.type === "error") {
+          setErrorMsg(data.message);
+          return;
+        }
+
+        // Raw game state blob
+        const myId = myIdRef.current;
+        if (myId && data.players[myId]) {
+          const sm = data.players[myId];
+          serverPosRef.current = { x: sm.position.x, y: sm.position.y };
+          // Re-anchor prediction on respawn (dead → alive transition)
+          if (!prevAliveRef.current[myId] && sm.alive) {
+            predictedPosRef.current = { x: sm.position.x, y: sm.position.y };
+          }
+        }
+        stateBufferRef.current.push({ t: Date.now(), players: data.players });
+        if (stateBufferRef.current.length > 40) stateBufferRef.current.shift();
+        stateRef.current = data;
+      };
+    }
+
+    connect();
+
+    return () => {
+      destroyed = true;
+      clearTimeout(retryTimer);
+      socketRef.current?.close();
     };
-
-    return () => { socket.close(); };
   }, []);
 
   // ── Canvas / input effect ──────────────────────────────────────────────
@@ -394,6 +442,94 @@ export default function Game() {
         : 0);
     }
 
+    // ── Client prediction ─────────────────────────────────────────────────
+    function predictStep() {
+      const myId = myIdRef.current;
+      const state = stateRef.current;
+      if (!myId || !state) return;
+      const me = state.players[myId];
+      if (!me?.alive) return;
+
+      // Hook extending outward → server zeroes velocity, don't move locally
+      if (me.hook && !me.hook.returning) {
+        if (serverPosRef.current) {
+          predictedPosRef.current.x += (serverPosRef.current.x - predictedPosRef.current.x) * 0.3;
+          predictedPosRef.current.y += (serverPosRef.current.y - predictedPosRef.current.y) * 0.3;
+        }
+        return;
+      }
+
+      // Replicate server movement with current inputs
+      let vx = 0, vy = 0;
+      if (keysRef.current["w"]) vy--;
+      if (keysRef.current["s"]) vy++;
+      if (keysRef.current["a"]) vx--;
+      if (keysRef.current["d"]) vx++;
+      const vlen = Math.sqrt(vx * vx + vy * vy);
+      if (vlen > 0) { vx /= vlen; vy /= vlen; }
+
+      let sf = 1.0;
+      if (hookChargeStartRef.current !== null) {
+        const ct = Math.min(1, (Date.now() - hookChargeStartRef.current) / CHARGE_RAMP_TIME);
+        sf = 1.0 - (1.0 - CHARGING_SPEED_MIN) * ct;
+      }
+
+      const pred = predictedPosRef.current;
+      pred.x = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.x + vx * sf * SPEED));
+      pred.y = Math.max(PLAYER_RADIUS, Math.min(MAP_SIZE - PLAYER_RADIUS, pred.y + vy * sf * SPEED));
+
+      // Reconcile with server authority
+      if (serverPosRef.current) {
+        const dx = serverPosRef.current.x - pred.x;
+        const dy = serverPosRef.current.y - pred.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > RECONCILE_SNAP) {
+          predictedPosRef.current = { x: serverPosRef.current.x, y: serverPosRef.current.y };
+        } else if (dist > 1) {
+          pred.x += dx * 0.3;
+          pred.y += dy * 0.3;
+        }
+      }
+    }
+
+    // ── State interpolation for remote players ─────────────────────────────
+    function getInterpPlayers(): Record<string, any> {
+      const buf = stateBufferRef.current;
+      if (buf.length === 0) return stateRef.current?.players ?? {};
+
+      const renderTime = Date.now() - INTERP_DELAY_MS;
+
+      // Find the two samples that bracket renderTime
+      let lo = buf[0];
+      let hi = buf[buf.length - 1];
+      for (let i = 0; i < buf.length - 1; i++) {
+        if (buf[i].t <= renderTime) lo = buf[i];
+        if (buf[i + 1].t >= renderTime) { hi = buf[i + 1]; break; }
+      }
+
+      if (renderTime <= lo.t) return lo.players;
+      if (renderTime >= hi.t) return hi.players;
+
+      const alpha = (renderTime - lo.t) / (hi.t - lo.t);
+      const result: Record<string, any> = {};
+      for (const id of Object.keys(hi.players)) {
+        const pH = hi.players[id];
+        const pL = lo.players[id] ?? pH;
+        const pos = {
+          x: pL.position.x + (pH.position.x - pL.position.x) * alpha,
+          y: pL.position.y + (pH.position.y - pL.position.y) * alpha,
+        };
+        const hook = (pH.hook && pL.hook)
+          ? { ...pH.hook, position: {
+              x: pL.hook.position.x + (pH.hook.position.x - pL.hook.position.x) * alpha,
+              y: pL.hook.position.y + (pH.hook.position.y - pL.hook.position.y) * alpha,
+            }}
+          : pH.hook;
+        result[id] = { ...pH, position: pos, hook };
+      }
+      return result;
+    }
+
     // ── Main render loop ──────────────────────────────────────────────────
     function render() {
       timeRef.current += 0.016;
@@ -410,22 +546,30 @@ export default function Game() {
         ctx.beginPath(); ctx.moveTo(0, i + drift); ctx.lineTo(800, i + drift); ctx.stroke();
       }
 
+      predictStep();
       updateInput();
       const state = stateRef.current;
+      const myId = myIdRef.current;
 
       if (state) {
-        const players = state.players as Record<string, any>;
+        // Interpolated state for all players
+        const displayPlayers = getInterpPlayers();
 
-        // Detect deaths → spawn particles
-        for (const [id, p] of Object.entries(players) as [string, any][]) {
+        // Override own player's position with client prediction
+        if (myId && displayPlayers[myId]?.alive) {
+          displayPlayers[myId] = { ...displayPlayers[myId], position: { ...predictedPosRef.current } };
+        }
+
+        // Detect deaths → spawn particles (server-authoritative)
+        for (const [id, p] of Object.entries(state.players) as [string, any][]) {
           if (prevAliveRef.current[id] === true && !p.alive) {
             spawnParticles(p.position.x, p.position.y, p.color || "#06b6d4");
           }
           prevAliveRef.current[id] = p.alive;
         }
 
-        // Hooks (draw before players)
-        Object.values(players).forEach((p: any) => {
+        // Hooks (draw before players; position already merged with prediction)
+        Object.values(displayPlayers).forEach((p: any) => {
           if (!p.hook) return;
           const color = p.color || "#06b6d4";
           drawRopeWire(p.position.x, p.position.y, p.hook.position.x, p.hook.position.y, time, color);
@@ -433,8 +577,8 @@ export default function Game() {
         });
 
         // Players
-        Object.values(players).forEach((p: any) => {
-          drawPlayer(p, p.id === myIdRef.current, time);
+        Object.values(displayPlayers).forEach((p: any) => {
+          drawPlayer(p, p.id === myId, time);
         });
       }
 
